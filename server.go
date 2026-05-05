@@ -1,9 +1,6 @@
-// server.go - روی سرور المان اجرا کن
 package main
 
 import (
-    "crypto/aes"
-    "crypto/cipher"
     "crypto/rand"
     "crypto/sha256"
     "crypto/tls"
@@ -11,23 +8,30 @@ import (
     "fmt"
     "io"
     "log"
+    mathrand "math/rand"
     "net"
     "time"
+    
     "golang.org/x/crypto/chacha20poly1305"
     "golang.org/x/crypto/hkdf"
 )
 
 const (
-    SERVER_PORT = ":8443"      // پورت تونل
-    XUI_PORT    = "127.0.0.1:443" // پورت XUI panel
+    SERVER_PORT = ":8443"
+    XUI_PORT    = "127.0.0.1:443"
     BUFFER_SIZE = 32768
-    PSK         = "d5f9a2c18e4b7063d91f2a8c4e5b60721d3f4a9b8e7c6d5a1f0e2b3c4d5a6b7e" // حتما عوض کن!
+    PSK         = "d5f9a2c18e4b7063d91f2a8c4e5b60721d3f4a9b8e7c6d5a1f0e2b3c4d5a6b7e"
 )
 
 type SecureTunnel struct {
-    aead   cipher.AEAD
-    conn   net.Conn
-    nonce  []byte
+    aead    interface {
+        Seal(dst, nonce, plaintext, additionalData []byte) []byte
+        Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, error)
+        NonceSize() int
+        Overhead() int
+    }
+    conn    net.Conn
+    nonce   []byte
     counter uint64
 }
 
@@ -69,8 +73,8 @@ func (st *SecureTunnel) getNonce() []byte {
 }
 
 func (st *SecureTunnel) encrypt(plaintext []byte) ([]byte, error) {
-    // Add random padding
-    padding := make([]byte, 16+rand.Intn(240))
+    paddingLen := 16 + mathrand.Intn(240)
+    padding := make([]byte, paddingLen)
     rand.Read(padding)
     
     data := append([]byte{byte(len(padding))}, padding...)
@@ -79,7 +83,6 @@ func (st *SecureTunnel) encrypt(plaintext []byte) ([]byte, error) {
     nonce := st.getNonce()
     ciphertext := st.aead.Seal(nil, nonce, data, nil)
     
-    // Prepend length
     result := make([]byte, 4+len(nonce)+len(ciphertext))
     binary.BigEndian.PutUint32(result[0:4], uint32(len(nonce)+len(ciphertext)))
     copy(result[4:], nonce)
@@ -101,7 +104,6 @@ func (st *SecureTunnel) decrypt(data []byte) ([]byte, error) {
         return nil, err
     }
     
-    // Remove padding
     if len(plaintext) < 1 {
         return nil, fmt.Errorf("invalid padding")
     }
@@ -114,7 +116,6 @@ func (st *SecureTunnel) decrypt(data []byte) ([]byte, error) {
 }
 
 func (st *SecureTunnel) readFrame() ([]byte, error) {
-    // Read length
     lenBuf := make([]byte, 4)
     if _, err := io.ReadFull(st.conn, lenBuf); err != nil {
         return nil, err
@@ -125,7 +126,6 @@ func (st *SecureTunnel) readFrame() ([]byte, error) {
         return nil, fmt.Errorf("frame too large")
     }
     
-    // Read frame
     frame := make([]byte, length)
     if _, err := io.ReadFull(st.conn, frame); err != nil {
         return nil, err
@@ -149,7 +149,6 @@ func handleClient(clientConn net.Conn) {
     
     log.Printf("New connection from %s", clientConn.RemoteAddr())
     
-    // Handshake
     salt := make([]byte, 32)
     if _, err := io.ReadFull(clientConn, salt); err != nil {
         log.Printf("Handshake failed: %v", err)
@@ -163,13 +162,11 @@ func handleClient(clientConn net.Conn) {
         return
     }
     
-    // Send nonce
     if _, err := clientConn.Write(tunnel.nonce); err != nil {
         log.Printf("Nonce send failed: %v", err)
         return
     }
     
-    // Connect to XUI
     xuiConn, err := net.DialTimeout("tcp", XUI_PORT, 10*time.Second)
     if err != nil {
         log.Printf("XUI connection failed: %v", err)
@@ -179,10 +176,8 @@ func handleClient(clientConn net.Conn) {
     
     log.Printf("Connected to XUI panel")
     
-    // Bidirectional relay
     done := make(chan bool, 2)
     
-    // Client -> XUI
     go func() {
         defer func() { done <- true }()
         for {
@@ -196,7 +191,6 @@ func handleClient(clientConn net.Conn) {
         }
     }()
     
-    // XUI -> Client
     go func() {
         defer func() { done <- true }()
         buf := make([]byte, BUFFER_SIZE)
@@ -216,7 +210,8 @@ func handleClient(clientConn net.Conn) {
 }
 
 func main() {
-    // Generate self-signed certificate
+    mathrand.Seed(time.Now().UnixNano())
+    
     cert, err := tls.LoadX509KeyPair("server.crt", "server.key")
     if err != nil {
         log.Fatal("Certificate load failed. Generate with:\n" +
